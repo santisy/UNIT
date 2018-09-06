@@ -36,6 +36,39 @@ import time
 # get_scheduler
 # weights_init
 
+def tensor_to_image(tensor_var):
+    mean = torch.FloatTensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1)
+    std = torch.FloatTensor([0.5, 0.5, 0.5]).view(1, 3, 1, 1)
+
+    tensor_var = tensor_var.cpu()
+
+    tensor_var = tensor_var * std + mean
+    im_array = tensor_var.squeeze(dim=0).mul(255).clamp(0, 255).byte()\
+            .permute(1, 2, 0).numpy() 
+
+    return im_array
+
+
+def find_latest_model_file(path, checkpoint, keyword=None):
+    """Find the lastest create VAE checkpoint path if any,
+    otherwise return ''.
+    Also allows to specify certain checkpoint manually by cfg.NET_VAE
+    """
+    if checkpoint != '':
+        return os.path.join(path, checkpoint)
+
+    try:
+        files = os.listdir(path)
+    except OSError: return '';
+
+    if len(files) == 0: return '';
+
+    paths = [os.path.join(path, basename) for basename
+            in files if basename.find(keyword) !=-1]
+    net_path = max(paths, key=os.path.getctime)
+
+    return  net_path
+
 def get_all_data_loaders(conf):
     batch_size = conf['batch_size']
     num_workers = conf['num_workers']

@@ -8,6 +8,12 @@ dgx/scripts/
 src/*jpg
 notebooks/.ipynb_checkpoints/*
 exps/
+text_logfiles
+exterior_models
+models
+output
+LPIPS
+data_io/*.pyc
 src/yaml_generator.py
 *.tar.gz
 *ipynb

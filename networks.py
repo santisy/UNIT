@@ -98,8 +98,11 @@ class AdaINGen(nn.Module):
         pad_type = params['pad_type']
         mlp_dim = params['mlp_dim']
 
+        self.params = params
+
         # style encoder
-        self.enc_style = StyleEncoder(4, input_dim, dim, style_dim, norm='none', activ=activ, pad_type=pad_type)
+        if not params['no_style_enc']:
+            self.enc_style = StyleEncoder(4, input_dim, dim, style_dim, norm='none', activ=activ, pad_type=pad_type)
 
         # content encoder
         self.enc_content = ContentEncoder(n_downsample, n_res, input_dim, dim, 'in', activ, pad_type=pad_type)
@@ -116,7 +119,11 @@ class AdaINGen(nn.Module):
 
     def encode(self, images):
         # encode an image to its content and style codes
-        style_fake = self.enc_style(images)
+        if not self.params['no_style_enc']:
+            style_fake = self.enc_style(images)
+        else:
+            style_fake = Variable(torch.randn(images.size(0), self.params['style_dim'], 1, 1).cuda())
+
         content = self.enc_content(images)
         return content, style_fake
 
@@ -156,10 +163,12 @@ class VAEGen(nn.Module):
         n_res = params['n_res']
         activ = params['activ']
         pad_type = params['pad_type']
+        self.z_num = params['z_num']
 
         # content encoder
         self.enc = ContentEncoder(n_downsample, n_res, input_dim, dim, 'in', activ, pad_type=pad_type)
-        self.dec = Decoder(n_downsample, n_res, self.enc.output_dim, input_dim, res_norm='in', activ=activ, pad_type=pad_type)
+        self.dec = Decoder(n_downsample, n_res, self.enc.output_dim, input_dim, res_norm='in', 
+                activ=activ, pad_type=pad_type, z_num=self.z_num)
 
     def forward(self, images):
         # This is a reduced VAE implementation where we assume the outputs are multivariate Gaussian distribution with mean = hiddens and std_dev = all ones.
@@ -176,9 +185,15 @@ class VAEGen(nn.Module):
         noise = Variable(torch.randn(hiddens.size()).cuda(hiddens.data.get_device()))
         return hiddens, noise
 
-    def decode(self, hiddens):
-        images = self.dec(hiddens)
-        return images
+    def decode(self, hiddens, z_var=None):
+        hid_size = hiddens.size()
+        if z_var is None:
+            z_var = Variable(torch.randn(hid_size[0], self.z_num)).cuda()
+        z_var_expanded = z_var.unsqueeze(dim=2).unsqueeze(dim=2).\
+                expand(hid_size[0], self.z_num, hid_size[2], hid_size[3])
+
+        images = self.dec(torch.cat((hiddens, z_var_expanded), dim=1))
+        return images, z_var
 
 
 ##################################################################################
@@ -221,10 +236,17 @@ class ContentEncoder(nn.Module):
         return self.model(x)
 
 class Decoder(nn.Module):
-    def __init__(self, n_upsample, n_res, dim, output_dim, res_norm='adain', activ='relu', pad_type='zero'):
+    def __init__(self, n_upsample, n_res, dim, output_dim, res_norm='adain', activ='relu', pad_type='zero', 
+            z_num=None):
         super(Decoder, self).__init__()
 
         self.model = []
+
+        if z_num is not None:
+            self.model += [
+                        Conv2dBlock(dim+z_num, dim, 3, 1, 1, norm='in', activation=activ, pad_type=pad_type)
+                    ]
+
         # AdaIN residual blocks
         self.model += [ResBlocks(n_res, dim, res_norm, activ, pad_type=pad_type)]
         # upsampling blocks

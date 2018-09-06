@@ -8,6 +8,22 @@ from torch.autograd import Variable
 import torch
 import torch.nn as nn
 import os
+import torch.nn.functional as F
+from exterior_models.pix2pixHD.networks import MultiscaleDiscriminator, \
+        GANLoss
+
+def compute_eg_loss(x_ba_digits, x_ba_eg_digits, 
+            x_ab_digits, x_ab_eg_digits, z_var_ba_1, z_var_ba_2,
+            z_var_ab_1, z_var_ab_2, params, _eps=1.0e-5):
+
+        digits_diff_ba = F.l1_loss(x_ba_digits, x_ba_eg_digits)
+        digits_diff_ab = F.l1_loss(x_ab_digits, x_ab_eg_digits)
+
+        batch_wise_z_l1_ba = F.l1_loss(z_var_ba_1, z_var_ba_2)
+        batch_wise_z_l1_ab = F.l1_loss(z_var_ab_1, z_var_ab_2)
+
+        return (- digits_diff_ab / (batch_wise_z_l1_ab + _eps)).mean() + \
+                (- digits_diff_ba / (batch_wise_z_l1_ba + _eps)).mean()
 
 class MUNIT_Trainer(nn.Module):
     def __init__(self, hyperparameters):
@@ -19,7 +35,7 @@ class MUNIT_Trainer(nn.Module):
         self.dis_a = MsImageDis(hyperparameters['input_dim_a'], hyperparameters['dis'])  # discriminator for domain a
         self.dis_b = MsImageDis(hyperparameters['input_dim_b'], hyperparameters['dis'])  # discriminator for domain b
         self.instancenorm = nn.InstanceNorm2d(512, affine=False)
-        self.style_dim = hyperparameters['gen']['style_dim']
+        self.style_dim = hyperparameters['gen']['z_num']
 
         # fix the noise used in sampling
         display_size = int(hyperparameters['display_size'])
@@ -77,6 +93,18 @@ class MUNIT_Trainer(nn.Module):
         # decode (cross domain)
         x_ba = self.gen_a.decode(c_b, s_a)
         x_ab = self.gen_b.decode(c_a, s_b)
+        '''decode (corss domain) for the second time using the same 
+        content code (c)'''
+        if hyperparameters['loss_eg_weight'] != 0:
+            s_a_eg = Variable(torch.randn(x_a.size(0), self.style_dim, 1, 1).cuda())
+            s_b_eg = Variable(torch.randn(x_b.size(0), self.style_dim, 1, 1).cuda())
+            x_ba_eg = self.gen_a.decode(c_b, s_a_eg).detach()
+            x_ab_eg = self.gen_b.decode(c_a, s_b_eg).detach()
+            self.loss_eg = compute_eg_loss(x_ba, x_ba_eg, x_ab, x_ab_eg, 
+                    s_a, s_a_eg, s_b, s_b_eg, hyperparameters)
+        else:
+            self.loss_eg = 0
+
         # encode again
         c_b_recon, s_a_recon = self.gen_a.encode(x_ba)
         c_a_recon, s_b_recon = self.gen_b.encode(x_ab)
@@ -87,8 +115,14 @@ class MUNIT_Trainer(nn.Module):
         # reconstruction loss
         self.loss_gen_recon_x_a = self.recon_criterion(x_a_recon, x_a)
         self.loss_gen_recon_x_b = self.recon_criterion(x_b_recon, x_b)
-        self.loss_gen_recon_s_a = self.recon_criterion(s_a_recon, s_a)
-        self.loss_gen_recon_s_b = self.recon_criterion(s_b_recon, s_b)
+
+        self.loss_gen_recon_s_a = self.recon_criterion(s_a_recon, s_a) if \
+                hyperparameters['loss_eg_weight'] == 0 and \
+                not hyperparameters['no_rec_s'] else 0
+        self.loss_gen_recon_s_b = self.recon_criterion(s_b_recon, s_b) if \
+                hyperparameters['loss_eg_weight'] == 0 and \
+                not hyperparameters['no_rec_s'] else 0
+
         self.loss_gen_recon_c_a = self.recon_criterion(c_a_recon, c_a)
         self.loss_gen_recon_c_b = self.recon_criterion(c_b_recon, c_b)
         self.loss_gen_cycrecon_x_a = self.recon_criterion(x_aba, x_a) if hyperparameters['recon_x_cyc_w'] > 0 else 0
@@ -111,7 +145,9 @@ class MUNIT_Trainer(nn.Module):
                               hyperparameters['recon_x_cyc_w'] * self.loss_gen_cycrecon_x_a + \
                               hyperparameters['recon_x_cyc_w'] * self.loss_gen_cycrecon_x_b + \
                               hyperparameters['vgg_w'] * self.loss_gen_vgg_a + \
-                              hyperparameters['vgg_w'] * self.loss_gen_vgg_b
+                              hyperparameters['vgg_w'] * self.loss_gen_vgg_b + \
+                              hyperparameters['loss_eg_weight'] * \
+                              self.loss_eg
         self.loss_gen_total.backward()
         self.gen_opt.step()
 
@@ -122,10 +158,11 @@ class MUNIT_Trainer(nn.Module):
         target_fea = vgg(target_vgg)
         return torch.mean((self.instancenorm(img_fea) - self.instancenorm(target_fea)) ** 2)
 
-    def sample(self, x_a, x_b):
+    def sample(self, x_a, x_b, training=True):
         self.eval()
-        s_a1 = Variable(self.s_a)
-        s_b1 = Variable(self.s_b)
+        if training:
+            s_a1 = Variable(self.s_a)
+            s_b1 = Variable(self.s_b)
         s_a2 = Variable(torch.randn(x_a.size(0), self.style_dim, 1, 1).cuda())
         s_b2 = Variable(torch.randn(x_b.size(0), self.style_dim, 1, 1).cuda())
         x_a_recon, x_b_recon, x_ba1, x_ba2, x_ab1, x_ab2 = [], [], [], [], [], []
@@ -134,14 +171,20 @@ class MUNIT_Trainer(nn.Module):
             c_b, s_b_fake = self.gen_b.encode(x_b[i].unsqueeze(0))
             x_a_recon.append(self.gen_a.decode(c_a, s_a_fake))
             x_b_recon.append(self.gen_b.decode(c_b, s_b_fake))
-            x_ba1.append(self.gen_a.decode(c_b, s_a1[i].unsqueeze(0)))
+
+            if training:
+                x_ba1.append(self.gen_a.decode(c_b, s_a1[i].unsqueeze(0)))
+                x_ab1.append(self.gen_b.decode(c_a, s_b1[i].unsqueeze(0)))
+
             x_ba2.append(self.gen_a.decode(c_b, s_a2[i].unsqueeze(0)))
-            x_ab1.append(self.gen_b.decode(c_a, s_b1[i].unsqueeze(0)))
             x_ab2.append(self.gen_b.decode(c_a, s_b2[i].unsqueeze(0)))
         x_a_recon, x_b_recon = torch.cat(x_a_recon), torch.cat(x_b_recon)
-        x_ba1, x_ba2 = torch.cat(x_ba1), torch.cat(x_ba2)
-        x_ab1, x_ab2 = torch.cat(x_ab1), torch.cat(x_ab2)
-        self.train()
+        if training:
+            x_ba1, x_ab1 = torch.cat(x_ba1), torch.cat(x_ab1)
+
+        x_ba2, x_ab2 = torch.cat(x_ba2), torch.cat(x_ab2)
+        if training:
+            self.train()
         return x_a, x_a_recon, x_ab1, x_ab2, x_b, x_b_recon, x_ba1, x_ba2
 
     def dis_update(self, x_a, x_b, hyperparameters):
@@ -198,7 +241,6 @@ class MUNIT_Trainer(nn.Module):
         torch.save({'a': self.dis_a.state_dict(), 'b': self.dis_b.state_dict()}, dis_name)
         torch.save({'gen': self.gen_opt.state_dict(), 'dis': self.dis_opt.state_dict()}, opt_name)
 
-
 class UNIT_Trainer(nn.Module):
     def __init__(self, hyperparameters):
         super(UNIT_Trainer, self).__init__()
@@ -206,9 +248,23 @@ class UNIT_Trainer(nn.Module):
         # Initiate the networks
         self.gen_a = VAEGen(hyperparameters['input_dim_a'], hyperparameters['gen'])  # auto-encoder for domain a
         self.gen_b = VAEGen(hyperparameters['input_dim_b'], hyperparameters['gen'])  # auto-encoder for domain b
-        self.dis_a = MsImageDis(hyperparameters['input_dim_a'], hyperparameters['dis'])  # discriminator for domain a
-        self.dis_b = MsImageDis(hyperparameters['input_dim_b'], hyperparameters['dis'])  # discriminator for domain b
+        if not hyperparameters['origin']:
+            self.dis_a = MultiscaleDiscriminator(hyperparameters['input_dim_a'],        # discriminator for a
+                    ndf=64, n_layers=3, norm_layer=nn.InstanceNorm2d, use_sigmoid=False,
+                    num_D=2, getIntermFeat=True
+                    )
+            self.dis_b = MultiscaleDiscriminator(hyperparameters['input_dim_b'],        # discriminator for b
+                    ndf=64, n_layers=3, norm_layer=nn.InstanceNorm2d, use_sigmoid=False,
+                    num_D=2, getIntermFeat=True
+                    )
+            self.criterionGAN = GANLoss(use_lsgan=True, tensor=torch.cuda.FloatTensor)
+
+        else:
+            self.dis_a = MsImageDis(hyperparameters['input_dim_a'], hyperparameters['dis'])
+            self.dis_b = MsImageDis(hyperparameters['input_dim_b'], hyperparameters['dis'])
+            
         self.instancenorm = nn.InstanceNorm2d(512, affine=False)
+
 
         # Setup the optimizers
         beta1 = hyperparameters['beta1']
@@ -234,6 +290,35 @@ class UNIT_Trainer(nn.Module):
             for param in self.vgg.parameters():
                 param.requires_grad = False
 
+    def compute_digits_differnce(self, digits1, digits2, weight=1.0):
+        feat_diff = 0
+        feat_weights = 4.0 / (3 + 1) # 3 layers's discrminator
+        D_weights = 1.0 / 2.0  # number of discrminator
+        for i in range(2):
+            for j in range(len(digits2[i])-1):
+                feat_diff += D_weights * feat_weights * \
+                    F.l1_loss(digits2[i][j],
+                            digits1[i][j].detach()) * weight
+        return feat_diff
+
+
+
+    def compute_gan_loss(self, real_digits, fake_digits, gan_cri,
+            loss_at='None'):
+        errD = None
+        errG = None
+        errG_feat = None
+        if gan_cri is not None:
+            if loss_at == 'D':
+                errD = (gan_cri(real_digits, True) \
+                        + gan_cri(fake_digits, False)) * 0.5
+            elif loss_at == 'G':
+                errG = gan_cri(fake_digits, True)
+                errG_feat = self.compute_digits_differnce(real_digits, fake_digits,
+                      weight=10.0)
+
+        return errD, errG, errG_feat
+
     def recon_criterion(self, input, target):
         return torch.mean(torch.abs(input - target))
 
@@ -241,8 +326,8 @@ class UNIT_Trainer(nn.Module):
         self.eval()
         h_a, _ = self.gen_a.encode(x_a)
         h_b, _ = self.gen_b.encode(x_b)
-        x_ba = self.gen_a.decode(h_b)
-        x_ab = self.gen_b.decode(h_a)
+        x_ba, _ = self.gen_a.decode(h_b)
+        x_ab, _ = self.gen_b.decode(h_a)
         self.train()
         return x_ab, x_ba
 
@@ -258,37 +343,99 @@ class UNIT_Trainer(nn.Module):
 
     def gen_update(self, x_a, x_b, hyperparameters):
         self.gen_opt.zero_grad()
-        # encode
+        ############ Encode #########################################$
         h_a, n_a = self.gen_a.encode(x_a)
         h_b, n_b = self.gen_b.encode(x_b)
         # decode (within domain)
-        x_a_recon = self.gen_a.decode(h_a + n_a)
-        x_b_recon = self.gen_b.decode(h_b + n_b)
-        # decode (cross domain)
-        x_ba = self.gen_a.decode(h_b + n_b)
-        x_ab = self.gen_b.decode(h_a + n_a)
+        if hyperparameters['zero_z']:
+            pre_Z = Variable(torch.zeros(hyperparameters['batch_size'], 
+                    hyperparameters['gen']['z_num']).cuda())
+        else:
+            pre_Z = None
+
+        ########### Reconstruction ###################################
+        x_a_recon, _ = self.gen_a.decode(h_a + n_a, z_var=pre_Z)
+        x_b_recon, _ = self.gen_b.decode(h_b + n_b, z_var=pre_Z)
+
+        ##############################################################
+        ########### Decode (Cross Domain) ############################
+        ##############################################################
+
+        ########## with random vector ################
+        x_ba, z_var_ba_1 = self.gen_a.decode(h_b + n_b)
+        x_ab, z_var_ab_1 = self.gen_b.decode(h_a + n_a)
+
+        ########## with zero latent vector ###########
+        x_ba_zero, _ = self.gen_a.decode(h_b + n_b, z_var=pre_Z)
+        x_ab_zero, _ = self.gen_b.decode(h_a + n_a, z_var=pre_Z)
+
+        ######## decode (cross domain the second time) ################
+        if hyperparameters['loss_eg_weight'] != 0:
+            x_ba_eg, z_var_ba_2 = self.gen_a.decode(h_b + n_b)
+            x_ab_eg, z_var_ab_2 = self.gen_b.decode(h_a + n_a)
+            x_ba_eg = x_ba_eg.detach()
+            x_ab_eg = x_ab_eg.detach()
+            if not hyperparameters['origin']:
+                x_ba_eg_digits = self.dis_a(x_ba_eg)
+                x_ab_eg_digits = self.dis_b(x_ab_eg)
+
         # encode again
-        h_b_recon, n_b_recon = self.gen_a.encode(x_ba)
-        h_a_recon, n_a_recon = self.gen_b.encode(x_ab)
+        h_b_recon, n_b_recon = self.gen_a.encode(x_ba_zero)
+        h_a_recon, n_a_recon = self.gen_b.encode(x_ab_zero)
         # decode again (if needed)
-        x_aba = self.gen_a.decode(h_a_recon + n_a_recon) if hyperparameters['recon_x_cyc_w'] > 0 else None
-        x_bab = self.gen_b.decode(h_b_recon + n_b_recon) if hyperparameters['recon_x_cyc_w'] > 0 else None
+        x_aba, _ = self.gen_a.decode(h_a_recon + n_a_recon, 
+                z_var=pre_Z
+                ) if hyperparameters['recon_x_cyc_w'] > 0 else (None, 0)
+        x_bab, _ = self.gen_b.decode(h_b_recon + n_b_recon, 
+                z_var=pre_Z
+                ) if hyperparameters['recon_x_cyc_w'] > 0 else (None, 0)
 
         # reconstruction loss
         self.loss_gen_recon_x_a = self.recon_criterion(x_a_recon, x_a)
         self.loss_gen_recon_x_b = self.recon_criterion(x_b_recon, x_b)
         self.loss_gen_recon_kl_a = self.__compute_kl(h_a)
         self.loss_gen_recon_kl_b = self.__compute_kl(h_b)
-        self.loss_gen_cyc_x_a = self.recon_criterion(x_aba, x_a)
-        self.loss_gen_cyc_x_b = self.recon_criterion(x_bab, x_b)
+        self.loss_gen_cyc_x_a = self.recon_criterion(x_aba, x_a) if x_aba is not None else 0
+        self.loss_gen_cyc_x_b = self.recon_criterion(x_bab, x_b) if x_bab is not None else 0
         self.loss_gen_recon_kl_cyc_aba = self.__compute_kl(h_a_recon)
         self.loss_gen_recon_kl_cyc_bab = self.__compute_kl(h_b_recon)
+
+        if hyperparameters['loss_eg_weight'] == 0:
+            self.loss_gen_adv_a, self.loss_gen_adv_b, self.loss_gan_feat_a, \
+                    self.loss_gan_feat_b = 0, 0, 0, 0
+        elif not hyperparameters['origin']:
+            x_ba_digits = self.dis_a(x_ba)
+            x_a_digits = self.dis_a(x_a)
+            _, self.loss_gen_adv_a, self.loss_gan_feat_a = \
+                    self.compute_gan_loss(x_a_digits, x_ba_digits, 
+                            self.criterionGAN, loss_at='G')
+
+            x_ab_digits = self.dis_a(x_ab)
+            x_b_digits = self.dis_a(x_b)
+            _, self.loss_gen_adv_b, self.loss_gan_feat_b = \
+                    self.compute_gan_loss(x_b_digits, x_ab_digits, 
+                            self.criterionGAN, loss_at='G')
+        else:
+            self.loss_gen_adv_a = self.dis_a.calc_gen_loss(x_ba)
+            self.loss_gen_adv_b = self.dis_b.calc_gen_loss(x_ab)
+            self.loss_gan_feat_a, self.loss_gan_feat_b = 0, 0
+
         # GAN loss
-        self.loss_gen_adv_a = self.dis_a.calc_gen_loss(x_ba)
-        self.loss_gen_adv_b = self.dis_b.calc_gen_loss(x_ab)
+        # self.loss_gen_adv_a = self.dis_a.calc_gen_loss(x_ba)
+        # self.loss_gen_adv_b = self.dis_b.calc_gen_loss(x_ab)
         # domain-invariant perceptual loss
         self.loss_gen_vgg_a = self.compute_vgg_loss(self.vgg, x_ba, x_b) if hyperparameters['vgg_w'] > 0 else 0
         self.loss_gen_vgg_b = self.compute_vgg_loss(self.vgg, x_ab, x_a) if hyperparameters['vgg_w'] > 0 else 0
+        if hyperparameters['loss_eg_weight'] == 0:
+            self.loss_eg = 0.0
+        elif not hyperparameters['origin']:
+            self.loss_eg = compute_eg_loss(x_ba_digits, x_ba_eg_digits, 
+                    x_ab_digits, x_ab_eg_digits, z_var_ba_1, z_var_ba_2,
+                     z_var_ab_1, z_var_ab_2, hyperparameters)
+        else:
+            self.loss_eg = compute_eg_loss(x_ba, x_ba_eg, 
+                    x_ab, x_ab_eg, z_var_ba_1, z_var_ba_2, z_var_ab_1, z_var_ab_2, 
+                    hyperparameters)
         # total loss
         self.loss_gen_total = hyperparameters['gan_w'] * self.loss_gen_adv_a + \
                               hyperparameters['gan_w'] * self.loss_gen_adv_b + \
@@ -301,7 +448,9 @@ class UNIT_Trainer(nn.Module):
                               hyperparameters['recon_x_cyc_w'] * self.loss_gen_cyc_x_b + \
                               hyperparameters['recon_kl_cyc_w'] * self.loss_gen_recon_kl_cyc_bab + \
                               hyperparameters['vgg_w'] * self.loss_gen_vgg_a + \
-                              hyperparameters['vgg_w'] * self.loss_gen_vgg_b
+                              self.loss_gan_feat_b + self.loss_gan_feat_a + \
+                              hyperparameters['vgg_w'] * self.loss_gen_vgg_b + \
+                              hyperparameters['loss_eg_weight'] * self.loss_eg
         self.loss_gen_total.backward()
         self.gen_opt.step()
 
@@ -318,10 +467,10 @@ class UNIT_Trainer(nn.Module):
         for i in range(x_a.size(0)):
             h_a, _ = self.gen_a.encode(x_a[i].unsqueeze(0))
             h_b, _ = self.gen_b.encode(x_b[i].unsqueeze(0))
-            x_a_recon.append(self.gen_a.decode(h_a))
-            x_b_recon.append(self.gen_b.decode(h_b))
-            x_ba.append(self.gen_a.decode(h_b))
-            x_ab.append(self.gen_b.decode(h_a))
+            x_a_recon.append(self.gen_a.decode(h_a)[0])
+            x_b_recon.append(self.gen_b.decode(h_b)[0])
+            x_ba.append(self.gen_a.decode(h_b)[0])
+            x_ab.append(self.gen_b.decode(h_a)[0])
         x_a_recon, x_b_recon = torch.cat(x_a_recon), torch.cat(x_b_recon)
         x_ba = torch.cat(x_ba)
         x_ab = torch.cat(x_ab)
@@ -334,11 +483,24 @@ class UNIT_Trainer(nn.Module):
         h_a, n_a = self.gen_a.encode(x_a)
         h_b, n_b = self.gen_b.encode(x_b)
         # decode (cross domain)
-        x_ba = self.gen_a.decode(h_b + n_b)
-        x_ab = self.gen_b.decode(h_a + n_a)
+        x_ba, _ = self.gen_a.decode(h_b + n_b)
+        x_ab, _ = self.gen_b.decode(h_a + n_a)
         # D loss
-        self.loss_dis_a = self.dis_a.calc_dis_loss(x_ba.detach(), x_a)
-        self.loss_dis_b = self.dis_b.calc_dis_loss(x_ab.detach(), x_b)
+        if not hyperparameters['origin']:
+            real_digits_a = self.dis_a(x_a)
+            fake_digits_a = self.dis_a(x_ba.detach())
+            real_digits_b = self.dis_b(x_b)
+            fake_digits_b = self.dis_b(x_ab.detach())
+
+            self.loss_dis_a, _, _ = self.compute_gan_loss(real_digits_a, fake_digits_a, 
+                    self.criterionGAN, loss_at='D')
+            self.loss_dis_b, _, _ = self.compute_gan_loss(real_digits_b, fake_digits_b, 
+                    self.criterionGAN, loss_at='D')
+        else:
+            self.loss_dis_a = self.dis_a.calc_dis_loss(x_ba.detach(), x_a)
+            self.loss_dis_b = self.dis_b.calc_dis_loss(x_ab.detach(), x_b)
+
+
         self.loss_dis_total = hyperparameters['gan_w'] * self.loss_dis_a + hyperparameters['gan_w'] * self.loss_dis_b
         self.loss_dis_total.backward()
         self.dis_opt.step()
