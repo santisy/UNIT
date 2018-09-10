@@ -79,30 +79,28 @@ class Dataset(data.Dataset):
 
 
     def sample_a(self):
-        sample_tensor = self.simple_trans(self.__get_Y_image())
+        sample_tensor = self.simple_trans(self.__get_image(stamp='a'))
         return torch.stack([sample_tensor,] * 3)
 
     def sample_b(self):
-        random_index = random.randint(0, len(self.filenames) - 1)
-        sample_tensor = self.simple_trans(self.__get_X_image(random_index)[0])
+        sample_tensor = self.simple_trans(self.__get_image(stamp='b'))
         return torch.stack([sample_tensor,] * 3)
 
-    def __get_X_image(self, index):
+    def __get_image(self, stamp=None):
+        index = random.randint(0, self.dataset_size - 1)
         file_name = self.filenames[index]
-        img_path = os.path.join(self.split_dir, 
-                '%s_leftImg8bit.png' % file_name)
-        X_img = Image.open(img_path).convert('RGB')
+        whole_image_path = os.path.join(self.split_dir, file_name)
+        whole_image = Image.open(whole_image_path)
+        whole_array = np.asarray(whole_image)
 
-        return X_img, file_name
+        if stamp == "a":
+            img = Image.fromarray(whole_array[:, 256:, :])
+        elif stamp == "b":
+            img = Image.fromarray(whole_array[:, :256, :])
 
-    def __get_Y_image(self):
-        random_index = random.randint(0, len(self.filenames_Y) - 1)
-        Y_file_name = self.filenames_Y[random_index]
-        Y_img = Image.open(os.path.join(self.Y_split_dir, Y_file_name))
 
-        return Y_img
+        return img
 
-         
 
     def __len__(self):
         return len(self.filenames)

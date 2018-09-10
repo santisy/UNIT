@@ -32,6 +32,7 @@ parser.add_argument('--cyc_rec_weight', type=float, default=-1.0)
 parser.add_argument('--rec_c_weight', type=float, default=-1.0)
 parser.add_argument('--zero_rec', action='store_true')
 parser.add_argument('--no_rec_s', action='store_true')
+parser.add_argument('--vgg_w', type=float, default=-1.0)
 parser.add_argument('--no_style_enc', action='store_true')
 opts = parser.parse_args()
 
@@ -49,6 +50,8 @@ config['origin'] = opts.origin
 config['zero_z'] = opts.zero_rec
 config['no_rec_s'] = opts.no_rec_s
 
+if opts.vgg_w != -1:
+    config['vgg_w'] = opts.vgg_w
 if opts.cyc_rec_weight != -1:
     config['recon_x_cyc_w'] = opts.cyc_rec_weight
 if opts.ne_weight != -1:
